@@ -1,7 +1,7 @@
 {
   "name": "four-quadrants",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 1420 --strictPort",
@@ -10,7 +10,8 @@
     "tauri": "tauri",
     "test": "vitest run",
     "test:e2e": "playwright test",
-    "check": "tsc -b"
+    "check": "tsc -b",
+    "package:macos": "bash scripts/package-macos.sh"
   },
   "dependencies": {
     "@dnd-kit/core": "^6.3.1",

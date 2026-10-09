@@ -11,6 +11,34 @@ pub struct Task {
     pub quadrant: String,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct TaskSnapshot {
+    pub revision: i64,
+    pub tasks: Vec<Task>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase", deny_unknown_fields)]
+pub enum TaskChange {
+    Add {
+        task: Task,
+    },
+    Patch {
+        id: String,
+        title: Option<String>,
+        completed: Option<bool>,
+        quadrant: Option<String>,
+    },
+    Remove {
+        id: String,
+    },
+    Move {
+        id: String,
+        quadrant: String,
+        before: Option<String>,
+    },
+}
+
 pub struct TaskDatabase(pub Mutex<Connection>);
 
 fn validate(tasks: &[Task]) -> Result<(), String> {
@@ -32,23 +60,16 @@ fn validate(tasks: &[Task]) -> Result<(), String> {
 impl TaskDatabase {
     pub fn open(path: &Path) -> Result<Self, String> {
         let connection = Connection::open(path).map_err(|e| e.to_string())?;
-        connection
-            .execute_batch(
-                "PRAGMA journal_mode = WAL;
-                 PRAGMA synchronous = FULL;
-                 PRAGMA busy_timeout = 5000;
-                 CREATE TABLE IF NOT EXISTS task_document (
-                    id INTEGER PRIMARY KEY CHECK (id = 1),
-                    version INTEGER NOT NULL,
-                    content TEXT NOT NULL
-                 );",
-            )
-            .map_err(|e| e.to_string())?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;
+             CREATE TABLE IF NOT EXISTS task_document (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, content TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS task_revision (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL);
+             INSERT OR IGNORE INTO task_revision VALUES (1, 0);"
+        ).map_err(|e| e.to_string())?;
         Ok(Self(Mutex::new(connection)))
     }
 
-    pub fn load(&self) -> Result<Vec<Task>, String> {
-        let connection = self.0.lock().map_err(|e| e.to_string())?;
+    fn read(connection: &Connection) -> Result<Vec<Task>, String> {
         let mut statement = connection
             .prepare("SELECT version, content FROM task_document WHERE id = 1")
             .map_err(|e| e.to_string())?;
@@ -67,20 +88,114 @@ impl TaskDatabase {
             }
         }
     }
-
-    pub fn save(&self, tasks: &[Task]) -> Result<(), String> {
-        validate(tasks)?;
-        let content = serde_json::to_string(tasks).map_err(|e| e.to_string())?;
-        let mut connection = self.0.lock().map_err(|e| e.to_string())?;
-        let transaction = connection.transaction().map_err(|e| e.to_string())?;
-        transaction
-            .execute(
-                "INSERT INTO task_document (id, version, content) VALUES (1, 1, ?1)
-                 ON CONFLICT(id) DO UPDATE SET content = excluded.content, version = excluded.version",
-                params![content],
+    pub fn snapshot(&self) -> Result<TaskSnapshot, String> {
+        let connection = self.0.lock().map_err(|e| e.to_string())?;
+        let tasks = Self::read(&connection)?;
+        let revision = connection
+            .query_row(
+                "SELECT revision FROM task_revision WHERE id = 1",
+                [],
+                |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        transaction.commit().map_err(|e| e.to_string())
+        Ok(TaskSnapshot { tasks, revision })
+    }
+    // Read, merge and write under one lock and transaction. A window only sends its intent.
+    pub fn commit(&self, changes: &[TaskChange]) -> Result<TaskSnapshot, String> {
+        let mut connection = self.0.lock().map_err(|e| e.to_string())?;
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        let mut tasks = Self::read(&transaction)?;
+        for change in changes {
+            match change {
+                TaskChange::Add { task } => {
+                    if !tasks.iter().any(|t| t.id == task.id) {
+                        tasks.push(task.clone());
+                    }
+                }
+                TaskChange::Patch {
+                    id,
+                    title,
+                    completed,
+                    quadrant,
+                } => {
+                    if let Some(task) = tasks.iter_mut().find(|t| &t.id == id) {
+                        if let Some(value) = title {
+                            task.title = value.clone();
+                        }
+                        if let Some(value) = completed {
+                            task.completed = *value;
+                        }
+                        if let Some(value) = quadrant {
+                            task.quadrant = value.clone();
+                        }
+                    }
+                }
+                TaskChange::Remove { id } => tasks.retain(|t| &t.id != id),
+                TaskChange::Move {
+                    id,
+                    quadrant,
+                    before,
+                } => {
+                    if before.as_ref() == Some(id) {
+                        continue;
+                    }
+                    if let Some(index) = tasks.iter().position(|t| &t.id == id) {
+                        let mut task = tasks.remove(index);
+                        task.quadrant = quadrant.clone();
+                        let index = before
+                            .as_ref()
+                            .and_then(|anchor| {
+                                tasks
+                                    .iter()
+                                    .position(|t| &t.id == anchor && &t.quadrant == quadrant)
+                            })
+                            .unwrap_or_else(|| {
+                                tasks
+                                    .iter()
+                                    .rposition(|t| &t.quadrant == quadrant)
+                                    .map(|i| i + 1)
+                                    .unwrap_or(tasks.len())
+                            });
+                        tasks.insert(index, task);
+                    }
+                }
+            }
+        }
+        validate(&tasks)?;
+        let content = serde_json::to_string(&tasks).map_err(|e| e.to_string())?;
+        transaction.execute(
+            "INSERT INTO task_document (id, version, content) VALUES (1, 1, ?1) ON CONFLICT(id) DO UPDATE SET content = excluded.content, version = excluded.version", params![content]
+        ).map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "UPDATE task_revision SET revision = revision + 1 WHERE id = 1",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        let revision = transaction
+            .query_row(
+                "SELECT revision FROM task_revision WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(TaskSnapshot { revision, tasks })
+    }
+    #[cfg(test)]
+    pub fn load(&self) -> Result<Vec<Task>, String> {
+        Ok(self.snapshot()?.tasks)
+    }
+    #[cfg(test)]
+    pub fn save(&self, tasks: &[Task]) -> Result<(), String> {
+        validate(tasks)?;
+        let existing = self.load()?;
+        let changes: Vec<TaskChange> = existing
+            .into_iter()
+            .map(|t| TaskChange::Remove { id: t.id })
+            .chain(tasks.iter().map(|t| TaskChange::Add { task: t.clone() }))
+            .collect();
+        self.commit(&changes).map(|_| ())
     }
 }
 
@@ -142,5 +257,111 @@ mod tests {
         db.save(&[task("a")]).unwrap();
         db.save(&[]).unwrap();
         assert_eq!(db.load().unwrap(), Vec::<Task>::new());
+    }
+
+    #[test]
+    fn two_windows_merge_fields_and_do_not_resurrect_deleted_tasks() {
+        let db = TaskDatabase::open(Path::new(":memory:")).unwrap();
+        db.commit(&[TaskChange::Add { task: task("a") }]).unwrap();
+        db.commit(&[TaskChange::Patch {
+            id: "a".into(),
+            title: Some("Edited in main".into()),
+            completed: None,
+            quadrant: None,
+        }])
+        .unwrap();
+        let snapshot = db
+            .commit(&[TaskChange::Patch {
+                id: "a".into(),
+                title: None,
+                completed: Some(true),
+                quadrant: None,
+            }])
+            .unwrap();
+        assert_eq!(snapshot.tasks[0].title, "Edited in main");
+        assert!(snapshot.tasks[0].completed);
+        db.commit(&[TaskChange::Remove { id: "a".into() }]).unwrap();
+        assert!(db
+            .commit(&[TaskChange::Patch {
+                id: "a".into(),
+                title: Some("late edit".into()),
+                completed: None,
+                quadrant: None
+            }])
+            .unwrap()
+            .tasks
+            .is_empty());
+    }
+    #[test]
+    fn parallel_commits_keep_both_windows_tasks_and_revision() {
+        let db = std::sync::Arc::new(TaskDatabase::open(Path::new(":memory:")).unwrap());
+        let threads: Vec<_> = (0..20)
+            .map(|i| {
+                let db = db.clone();
+                std::thread::spawn(move || {
+                    db.commit(&[TaskChange::Add {
+                        task: task(&i.to_string()),
+                    }])
+                    .unwrap()
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let snapshot = db.snapshot().unwrap();
+        assert_eq!(snapshot.tasks.len(), 20);
+        assert_eq!(snapshot.revision, 20);
+    }
+    #[test]
+    fn invalid_batch_rolls_back_all_changes_and_revision() {
+        let db = TaskDatabase::open(Path::new(":memory:")).unwrap();
+        let mut invalid = task("b");
+        invalid.quadrant = "unknown".into();
+        assert!(db
+            .commit(&[
+                TaskChange::Add { task: task("a") },
+                TaskChange::Add { task: invalid }
+            ])
+            .is_err());
+        assert_eq!(db.snapshot().unwrap().revision, 0);
+        assert!(db.load().unwrap().is_empty());
+    }
+    #[test]
+    fn moving_uses_latest_order_and_preserves_other_window_additions() {
+        let db = TaskDatabase::open(Path::new(":memory:")).unwrap();
+        db.save(&[task("a"), task("b"), task("c")]).unwrap();
+        db.commit(&[TaskChange::Move {
+            id: "a".into(),
+            quadrant: "do".into(),
+            before: None,
+        }])
+        .unwrap();
+        db.commit(&[TaskChange::Add { task: task("d") }]).unwrap();
+        let snapshot = db
+            .commit(&[TaskChange::Move {
+                id: "c".into(),
+                quadrant: "plan".into(),
+                before: None,
+            }])
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .filter(|t| t.quadrant == "do")
+                .map(|t| t.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["b", "a", "d"]
+        );
+        assert_eq!(
+            snapshot
+                .tasks
+                .iter()
+                .find(|t| t.id == "c")
+                .unwrap()
+                .quadrant,
+            "plan"
+        );
     }
 }
