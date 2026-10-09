@@ -1,0 +1,17 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/gen/
+test-results/
+playwright-report/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+release/*
+!release/*.dmg
+!release/*.app.zip
+!release/SHA256SUMS.txt

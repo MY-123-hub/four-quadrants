@@ -1,0 +1,2 @@
+# Preserve third-party license text verbatim without whitespace linting.
+docs/THIRD-PARTY-NOTICES.txt -whitespace
