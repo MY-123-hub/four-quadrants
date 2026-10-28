@@ -2,14 +2,15 @@ import { useSyncExternalStore } from 'react';
 import { moveTask, type QuadrantId, type Task } from '../domain/tasks';
 import { applyChanges, changesBetween, type TaskChange, type TaskSnapshot } from '../domain/changes';
 import { repository, type TaskRepository } from './repository';
-type State = { tasks: Task[]; ready: boolean; saving: boolean; error: string | null };
+type State = { tasks: Task[]; mindmaps: Record<string, string>; ready: boolean; saving: boolean; error: string | null };
 export class TaskStore {
   constructor(private persistence: TaskRepository = repository) {}
-  private state: State = { tasks: [], ready: false, saving: false, error: null };
+  private state: State = { tasks: [], mindmaps: {}, ready: false, saving: false, error: null };
   private base: TaskSnapshot = { revision: -1, tasks: [] };
   private listeners = new Set<() => void>();
   private pending: TaskChange[][] = [];
   private queue: Promise<void> | null = null;
+  private operations = new Set<Promise<unknown>>();
   private loading: Promise<void> | null = null;
   private subscribed = false;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
@@ -18,7 +19,13 @@ export class TaskStore {
   private receive = (snapshot: TaskSnapshot) => {
     if (snapshot.revision < this.base.revision) return;
     this.base = snapshot;
-    this.publish({ tasks: applyChanges(snapshot.tasks, this.pending.flat()), ready: true });
+    this.publish({ tasks: applyChanges(snapshot.tasks, this.pending.flat()), mindmaps: snapshot.mindmaps ?? {}, ready: true });
+  };
+  acceptSnapshot = (snapshot: TaskSnapshot) => this.receive(snapshot);
+  trackOperation = async <T,>(action: () => Promise<T>): Promise<T> => {
+    const operation = action();
+    this.operations.add(operation);
+    try { return await operation; } finally { this.operations.delete(operation); }
   };
   load = () => {
     if (this.loading) return this.loading;
@@ -68,7 +75,7 @@ export class TaskStore {
   }
   retry = () => { if (!this.state.ready) void this.load(); else { this.publish({ error: null }); this.drain(); } };
   flush = async () => {
-    do { await this.queue; } while (this.queue);
+    do { await Promise.allSettled([this.queue, ...this.operations]); } while (this.queue || this.operations.size);
     return !this.pending.length;
   };
 }

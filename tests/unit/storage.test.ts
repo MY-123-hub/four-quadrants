@@ -46,16 +46,16 @@ it('retains unsaved changes after disk failure, incorporates remote changes and 
   expect(await store.flush()).toBe(true);
   expect(other.getSnapshot().tasks).toEqual(store.getSnapshot().tasks);
 });
-it('merges concurrent edits from two windows without losing additions or unrelated fields', async () => {
+it('merges concurrent edits from independent stores without losing additions or unrelated fields', async () => {
   const shared = memoryRepository([task], 5);
-  const main = new TaskStore(shared.repository), widget = new TaskStore(shared.repository);
-  await main.load(); await widget.load();
+  const main = new TaskStore(shared.repository), other = new TaskStore(shared.repository);
+  await main.load(); await other.load();
   main.change(tasks => tasks.map(t => ({ ...t, title: 'Edited in main' })));
-  widget.change(tasks => tasks.map(t => ({ ...t, completed: true })));
+  other.change(tasks => tasks.map(t => ({ ...t, completed: true })));
   main.change(tasks => [...tasks, { ...task, id: 'b', title: '新增 B' }]);
-  widget.change(tasks => [...tasks, { ...task, id: 'c', title: '新增 C' }]);
-  await Promise.all([main.flush(), widget.flush()]);
-  expect(main.getSnapshot().tasks).toEqual(widget.getSnapshot().tasks);
+  other.change(tasks => [...tasks, { ...task, id: 'c', title: '新增 C' }]);
+  await Promise.all([main.flush(), other.flush()]);
+  expect(main.getSnapshot().tasks).toEqual(other.getSnapshot().tasks);
   expect(main.getSnapshot().tasks).toHaveLength(3);
   expect(main.getSnapshot().tasks.find(t => t.id === 'a')).toEqual({ ...task, title: 'Edited in main', completed: true });
 });
@@ -81,14 +81,34 @@ it('does not overwrite unreadable data and permits quitting without edits', asyn
 });
 it('moves one task using an anchor while preserving concurrent additions', async () => {
   const shared = memoryRepository([task, { ...task, id: 'b' }], 5);
-  const main = new TaskStore(shared.repository), widget = new TaskStore(shared.repository);
-  await main.load(); await widget.load();
+  const main = new TaskStore(shared.repository), other = new TaskStore(shared.repository);
+  await main.load(); await other.load();
   main.move('a', 'do', 'b');
-  widget.change(tasks => [...tasks, { ...task, id: 'c' }]);
-  await Promise.all([main.flush(), widget.flush()]);
+  other.change(tasks => [...tasks, { ...task, id: 'c' }]);
+  await Promise.all([main.flush(), other.flush()]);
   expect(main.getSnapshot().tasks.map(t => t.id)).toEqual(['b', 'a', 'c']);
 });
 it('only sends the changed field, even when another field differs on disk', () => {
   const changes: TaskChange[] = [{ kind: 'patch', id: 'a', completed: true }];
   expect(applyChanges([{ ...task, title: '新标题' }], changes)).toEqual([{ ...task, title: '新标题', completed: true }]);
+});
+it('keeps map associations and pending title edits together, rejects late map snapshots', async () => {
+  let receive!: (snapshot: TaskSnapshot) => void;
+  let complete!: (snapshot: TaskSnapshot) => void;
+  const store = new TaskStore({ load: async () => ({ revision: 1, tasks: [task] }), subscribe: async listener => { receive = listener; return () => {}; }, commit: async () => new Promise(resolve => { complete = resolve; }) });
+  await store.load(); store.change(tasks => tasks.map(t => ({ ...t, title: '正在编辑' })));
+  receive({ revision: 3, tasks: [{ ...task, title: '正在编辑' }], mindmaps: { a: '/maps/a.xmind' } });
+  complete({ revision: 2, tasks: [{ ...task, title: '正在编辑' }] }); await store.flush();
+  expect(store.getSnapshot().mindmaps).toEqual({ a: '/maps/a.xmind' });
+  expect(store.getSnapshot().tasks[0].title).toBe('正在编辑');
+  receive({ revision: 2, tasks: [task] });
+  expect(store.getSnapshot().mindmaps.a).toBe('/maps/a.xmind');
+});
+it('waits for a pending native map operation before hiding or exiting', async () => {
+  const store = new TaskStore(memoryRepository([task]).repository); await store.load();
+  let finish!: () => void;
+  const operation = store.trackOperation(() => new Promise<void>(resolve => { finish = resolve; }));
+  let flushed = false; const flushing = store.flush().then(value => { flushed = true; return value; });
+  await Promise.resolve(); expect(flushed).toBe(false);
+  finish(); await operation; expect(await flushing).toBe(true);
 });

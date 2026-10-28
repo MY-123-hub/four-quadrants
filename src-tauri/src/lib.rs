@@ -1,5 +1,8 @@
+mod automation;
+mod mindmaps;
 mod storage;
 mod windows;
+pub use automation::entry as automation_entry;
 use std::{
     collections::HashSet,
     sync::{
@@ -75,17 +78,14 @@ fn finish_exit(app: tauri::AppHandle, window: tauri::WebviewWindow, success: boo
 
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(StateFlags::POSITION | StateFlags::SIZE)
                 .build(),
         )
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
-            if let Some(window) = app.get_webview_window("main") {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
-            }
+            let _ = windows::show_main(app.clone());
         }))
         .setup(|app| {
             app.manage(ExitGuard {
@@ -119,13 +119,6 @@ pub fn run() {
                     &PredefinedMenuItem::select_all(app, Some("全选"))?,
                 ],
             )?;
-            let widget = MenuItem::with_id(
-                app,
-                "show-widget",
-                "显示悬浮小组件",
-                true,
-                Some("CmdOrCtrl+Shift+W"),
-            )?;
             let main = MenuItem::with_id(
                 app,
                 "show-main",
@@ -142,7 +135,6 @@ pub fn run() {
                     &PredefinedMenuItem::maximize(app, Some("缩放"))?,
                     &PredefinedMenuItem::close_window(app, Some("关闭窗口"))?,
                     &PredefinedMenuItem::separator(app)?,
-                    &widget,
                     &main,
                 ],
             )?;
@@ -156,31 +148,49 @@ pub fn run() {
                 TaskDatabase::open(&path.join("tasks.sqlite3"))
             })();
             app.manage(database);
-            let preferences = windows::load_preferences(app.handle());
-            app.manage(windows::Preferences(Mutex::new(preferences.clone())));
-            if let Some(widget) = app.get_webview_window("widget") {
-                windows::prepare_widget(&widget)?;
-            }
-            if preferences.visible {
-                windows::show_widget(app.handle().clone()).map_err(std::io::Error::other)?;
-            }
+            // External processes use the same transactional storage. Observe
+            // revisions so the main window receives their commits too.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                let mut revision = -1;
+                let mut failed = false;
+                loop {
+                    let database = handle.state::<Result<TaskDatabase, String>>();
+                    let result = database
+                        .inner()
+                        .as_ref()
+                        .map_err(Clone::clone)
+                        .and_then(|db| db.snapshot());
+                    match result {
+                        Ok(snapshot) => {
+                            failed = false;
+                            if snapshot.revision != revision {
+                                revision = snapshot.revision;
+                                let _ = handle.emit("tasks-updated", snapshot);
+                            }
+                        }
+                        Err(error) => {
+                            if !failed {
+                                eprintln!("无法刷新外部任务变更：{error}");
+                            }
+                            failed = true;
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(750));
+                }
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            mindmaps::mindmap_action,
             load_tasks,
             commit_tasks,
             finish_exit,
             windows::show_main,
-            windows::show_widget,
-            windows::hide_window,
-            windows::widget_preferences,
-            windows::set_widget_pinned
+            windows::hide_window
         ])
         .on_menu_event(|app, event| match event.id().as_ref() {
             "quit" => request_exit(app),
-            "show-widget" => {
-                let _ = windows::show_widget(app.clone());
-            }
             "show-main" => {
                 let _ = windows::show_main(app.clone());
             }

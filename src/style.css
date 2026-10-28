@@ -84,3 +84,31 @@ h2 { margin: 0; font-size: 17px; font-weight: 550; line-height: 25px; letter-spa
 }
 @media (max-height: 560px) { .quadrant { padding-top: 12px; } .quadrant-header { margin-bottom: 10px; } .board { padding-top: 0; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; scroll-behavior: auto !important; } }
+
+.mindmap-button { display: flex; align-items: center; justify-content: center; flex: 0 0 28px; width: 28px; height: 28px; padding: 6px; border-radius: 4px; color: var(--muted); transition: color 140ms, background 140ms; }
+.mindmap-button svg { width: 16px; height: 16px; }
+.mindmap-button.is-linked { color: var(--focus); }
+.mindmap-button:hover { color: var(--ink); background: var(--hover); }
+.mindmap-button:disabled { opacity: .4; cursor: default; }
+.mindmap-button[aria-busy="true"] { cursor: progress; }
+.mindmap-dialog { width: min(292px, calc(100vw - 32px)); max-height: calc(100vh - 24px); padding: 0; border: 1px solid var(--line); border-radius: 10px; background: var(--paper); color: var(--ink); box-shadow: 0 8px 36px #0002; }
+.mindmap-dialog::backdrop { background: #0002; }
+.mindmap-dialog-content { padding: 16px; }
+.mindmap-dialog header { display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+.mindmap-dialog h2 { font-size: 14px; line-height: 22px; }
+.mindmap-task-name { margin: 6px 0 16px; font-size: 12px; line-height: 19px; color: var(--muted); overflow-wrap: anywhere; max-height: 57px; overflow-y: auto; }
+.mindmap-choices { display: grid; gap: 6px; }
+.mindmap-choices button { text-align: left; padding: 10px 12px; border: 1px solid var(--line); border-radius: 5px; font-size: 13px; line-height: 20px; }
+.mindmap-choices button:hover { background: var(--hover); }
+.mindmap-dialog button:disabled { opacity: .45; cursor: progress; }
+.mindmap-error { font-size: 12px; line-height: 19px; color: #a05244; margin: 0 0 14px; overflow-wrap: anywhere; }
+.mindmap-status { margin: 10px 0 0; font-size: 12px; color: var(--muted); }
+@media (prefers-color-scheme: dark) { .mindmap-error { color: #d8a497; } }
+
+.task-row.is-selected, .task-row.is-selected:hover { background: var(--hover); box-shadow: inset 2px 0 var(--accent); }
+
+.window-top { position: relative; }
+.window-actions { position: absolute; right: 18px; top: 8px; display: flex; align-items: center; gap: 4px; }
+
+#root { transition: opacity 140ms ease-out; }
+.window-hiding #root { opacity: 0; }

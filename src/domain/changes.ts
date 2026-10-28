@@ -5,7 +5,7 @@ export type TaskChange =
   | { kind: 'patch'; id: string; title?: string; completed?: boolean; quadrant?: QuadrantId }
   | { kind: 'remove'; id: string }
   | { kind: 'move'; id: string; quadrant: QuadrantId; before: string | null };
-export interface TaskSnapshot { revision: number; tasks: Task[] }
+export interface TaskSnapshot { revision: number; tasks: Task[]; mindmaps?: Record<string, string> }
 
 // UI updates express only the fields the person changed, never a stale document.
 export function changesBetween(previous: Task[], next: Task[]): TaskChange[] {

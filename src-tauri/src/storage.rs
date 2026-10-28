@@ -1,6 +1,10 @@
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, TransactionBehavior};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, path::Path, sync::Mutex};
+use std::{
+    collections::{HashMap, HashSet},
+    path::Path,
+    sync::Mutex,
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -15,6 +19,7 @@ pub struct Task {
 pub struct TaskSnapshot {
     pub revision: i64,
     pub tasks: Vec<Task>,
+    pub mindmaps: HashMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -41,6 +46,14 @@ pub enum TaskChange {
 
 pub struct TaskDatabase(pub Mutex<Connection>);
 
+pub fn validate_quadrant(quadrant: &str) -> Result<(), String> {
+    if ["do", "plan", "delegate", "eliminate"].contains(&quadrant) {
+        Ok(())
+    } else {
+        Err("象限必须是 do / plan / delegate / eliminate。".into())
+    }
+}
+
 fn validate(tasks: &[Task]) -> Result<(), String> {
     let mut ids = HashSet::new();
     for task in tasks {
@@ -49,7 +62,7 @@ fn validate(tasks: &[Task]) -> Result<(), String> {
             || task.title.trim().is_empty()
             // JavaScript counts UTF-16 code units; match that limit exactly.
             || task.title.encode_utf16().count() > 1000
-            || !["do", "plan", "delegate", "eliminate"].contains(&task.quadrant.as_str())
+            || validate_quadrant(&task.quadrant).is_err()
         {
             return Err("任务数据格式不正确，未写入磁盘。".into());
         }
@@ -60,11 +73,17 @@ fn validate(tasks: &[Task]) -> Result<(), String> {
 impl TaskDatabase {
     pub fn open(path: &Path) -> Result<Self, String> {
         let connection = Connection::open(path).map_err(|e| e.to_string())?;
+        connection
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| e.to_string())?;
         connection.execute_batch(
             "PRAGMA journal_mode = WAL; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;
              CREATE TABLE IF NOT EXISTS task_document (id INTEGER PRIMARY KEY CHECK (id = 1), version INTEGER NOT NULL, content TEXT NOT NULL);
              CREATE TABLE IF NOT EXISTS task_revision (id INTEGER PRIMARY KEY CHECK (id = 1), revision INTEGER NOT NULL);
-             INSERT OR IGNORE INTO task_revision VALUES (1, 0);"
+             INSERT OR IGNORE INTO task_revision VALUES (1, 0);
+             CREATE TABLE IF NOT EXISTS task_mindmaps (task_id TEXT PRIMARY KEY, path TEXT NOT NULL);
+             CREATE TRIGGER IF NOT EXISTS retain_task_mindmaps AFTER UPDATE OF content ON task_document
+             BEGIN DELETE FROM task_mindmaps WHERE task_id NOT IN (SELECT json_extract(value, '$.id') FROM json_each(NEW.content)); END;"
         ).map_err(|e| e.to_string())?;
         Ok(Self(Mutex::new(connection)))
     }
@@ -88,9 +107,8 @@ impl TaskDatabase {
             }
         }
     }
-    pub fn snapshot(&self) -> Result<TaskSnapshot, String> {
-        let connection = self.0.lock().map_err(|e| e.to_string())?;
-        let tasks = Self::read(&connection)?;
+    fn read_snapshot(connection: &Connection) -> Result<TaskSnapshot, String> {
+        let tasks = Self::read(connection)?;
         let revision = connection
             .query_row(
                 "SELECT revision FROM task_revision WHERE id = 1",
@@ -98,14 +116,108 @@ impl TaskDatabase {
                 |row| row.get(0),
             )
             .map_err(|e| e.to_string())?;
-        Ok(TaskSnapshot { tasks, revision })
+        let mut statement = connection
+            .prepare("SELECT task_id, path FROM task_mindmaps")
+            .map_err(|e| e.to_string())?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|e| e.to_string())?;
+        let mut mindmaps = HashMap::new();
+        for row in rows {
+            let (id, path) = row.map_err(|e| e.to_string())?;
+            if tasks.iter().any(|task| task.id == id) {
+                mindmaps.insert(id, path);
+            }
+        }
+        Ok(TaskSnapshot {
+            revision,
+            tasks,
+            mindmaps,
+        })
+    }
+    pub fn snapshot(&self) -> Result<TaskSnapshot, String> {
+        let mut connection = self.0.lock().map_err(|e| e.to_string())?;
+        // Tasks, associations and revision belong to the same read transaction.
+        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        let snapshot = Self::read_snapshot(&transaction)?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(snapshot)
+    }
+    // Associations stay outside the v1 task document so older CLI/MCP writers
+    // preserve them. The trigger also handles deletions by an older process.
+    pub fn link_mindmap(
+        &self,
+        id: &str,
+        path: &Path,
+        replace: bool,
+    ) -> Result<TaskSnapshot, String> {
+        if !path.is_absolute()
+            || path
+                .extension()
+                .and_then(|s| s.to_str())
+                .is_none_or(|s| !s.eq_ignore_ascii_case("xmind"))
+        {
+            return Err("请选择本机的 .xmind 文件。".into());
+        }
+        let path = path.to_str().ok_or("文件路径无法识别。")?;
+        let mut connection = self.0.lock().map_err(|e| e.to_string())?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
+        let snapshot = Self::read_snapshot(&transaction)?;
+        if !snapshot.tasks.iter().any(|task| task.id == id) {
+            return Err("任务已删除，无法关联导图。".into());
+        }
+        if !replace && snapshot.mindmaps.contains_key(id) {
+            return Ok(snapshot);
+        }
+        transaction.execute("INSERT INTO task_mindmaps (task_id, path) VALUES (?1, ?2) ON CONFLICT(task_id) DO UPDATE SET path = excluded.path", params![id, path]).map_err(|e| e.to_string())?;
+        transaction
+            .execute(
+                "UPDATE task_revision SET revision = revision + 1 WHERE id = 1",
+                [],
+            )
+            .map_err(|e| e.to_string())?;
+        let snapshot = Self::read_snapshot(&transaction)?;
+        transaction.commit().map_err(|e| e.to_string())?;
+        Ok(snapshot)
     }
     // Read, merge and write under one lock and transaction. A window only sends its intent.
     pub fn commit(&self, changes: &[TaskChange]) -> Result<TaskSnapshot, String> {
+        self.commit_inner(changes, false)
+    }
+    pub fn commit_external(&self, changes: &[TaskChange]) -> Result<TaskSnapshot, String> {
+        self.commit_inner(changes, true)
+    }
+    fn commit_inner(&self, changes: &[TaskChange], strict: bool) -> Result<TaskSnapshot, String> {
         let mut connection = self.0.lock().map_err(|e| e.to_string())?;
-        let transaction = connection.transaction().map_err(|e| e.to_string())?;
+        // Reserve the writer before reading, so independent processes wait and
+        // merge into the latest document instead of racing a deferred upgrade.
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|e| e.to_string())?;
         let mut tasks = Self::read(&transaction)?;
         for change in changes {
+            if strict {
+                match change {
+                    TaskChange::Add { task } => {
+                        if let Some(existing) = tasks.iter().find(|t| t.id == task.id) {
+                            if existing != task {
+                                return Err("任务 ID 已存在且内容不同，请先查询任务。".into());
+                            }
+                        }
+                    }
+                    TaskChange::Patch { id, .. }
+                    | TaskChange::Remove { id }
+                    | TaskChange::Move { id, .. } => {
+                        if !tasks.iter().any(|t| &t.id == id) {
+                            return Err("找不到任务，请先查询任务 ID。".into());
+                        }
+                    }
+                }
+            }
             match change {
                 TaskChange::Add { task } => {
                     if !tasks.iter().any(|t| t.id == task.id) {
@@ -172,15 +284,9 @@ impl TaskDatabase {
                 [],
             )
             .map_err(|e| e.to_string())?;
-        let revision = transaction
-            .query_row(
-                "SELECT revision FROM task_revision WHERE id = 1",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(|e| e.to_string())?;
+        let snapshot = Self::read_snapshot(&transaction)?;
         transaction.commit().map_err(|e| e.to_string())?;
-        Ok(TaskSnapshot { revision, tasks })
+        Ok(snapshot)
     }
     #[cfg(test)]
     pub fn load(&self) -> Result<Vec<Task>, String> {
@@ -312,6 +418,41 @@ mod tests {
         let snapshot = db.snapshot().unwrap();
         assert_eq!(snapshot.tasks.len(), 20);
         assert_eq!(snapshot.revision, 20);
+    }
+    #[test]
+    fn independent_connections_merge_writes_and_read_consistent_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tasks.sqlite3");
+        TaskDatabase::open(&path).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(9));
+        let threads: Vec<_> = (0..8)
+            .map(|writer| {
+                let path = path.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let db = TaskDatabase::open(&path).unwrap();
+                    barrier.wait();
+                    for i in 0..10 {
+                        db.commit_external(&[TaskChange::Add {
+                            task: task(&format!("{writer}-{i}")),
+                        }])
+                        .unwrap();
+                        let snapshot = db.snapshot().unwrap();
+                        assert_eq!(snapshot.revision as usize, snapshot.tasks.len());
+                    }
+                })
+            })
+            .collect();
+        let db = TaskDatabase::open(&path).unwrap();
+        barrier.wait();
+        for _ in 0..300 {
+            let snapshot = db.snapshot().unwrap();
+            assert_eq!(snapshot.revision as usize, snapshot.tasks.len());
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(db.snapshot().unwrap().tasks.len(), 80);
     }
     #[test]
     fn invalid_batch_rolls_back_all_changes_and_revision() {

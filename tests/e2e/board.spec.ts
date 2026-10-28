@@ -18,7 +18,7 @@ async function drag(page: Page, title: string, target: { x: number; y: number })
 test.beforeEach(async ({ page }) => { await page.goto('/'); await expect(page.locator('.quadrant')).toHaveCount(4); });
 test('create, inline edit, finish, undo, delete and reload', async ({ page }) => {
   await add(page, 'do', '核对 Mac 交付清单');
-  await page.getByRole('button', { name: '核对 Mac 交付清单', exact: true }).click();
+  await page.getByRole('button', { name: '核对 Mac 交付清单', exact: true }).dblclick();
   await page.getByRole('textbox').fill('核对 Mac 最终清单');
   await page.getByRole('textbox').press('Enter');
   const check = page.getByRole('checkbox', { name: '完成 核对 Mac 最终清单' });
@@ -43,7 +43,7 @@ test('empty input, escape, blur and Chinese composition', async ({ page }) => {
   await expect(input).toBeVisible();
   await page.locator('h2').first().click();
   await expect(zone(page, 'plan').getByRole('button', { name: '中文输入法', exact: true })).toBeVisible();
-  await page.getByRole('button', { name: '中文输入法', exact: true }).click();
+  await page.getByRole('button', { name: '中文输入法', exact: true }).dblclick();
   await page.getByRole('textbox').fill('不保存这个修改'); await page.getByRole('textbox').press('Escape');
   await expect(zone(page, 'plan').getByRole('button', { name: '中文输入法', exact: true })).toBeVisible();
 });

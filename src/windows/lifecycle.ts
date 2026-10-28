@@ -15,13 +15,6 @@ export async function hideCurrentWindow() {
   try { if (native) await invoke('hide_window'); }
   finally { document.documentElement.classList.remove('window-hiding'); }
 }
-export async function showWidget() {
-  if (native) await invoke('show_widget');
-  else window.open('/?widget', 'four-quadrants-widget', 'width=380,height=360');
-}
-export async function showMain() {
-  if (native) await invoke('show_main'); else window.open('/', 'four-quadrants-main');
-}
 export function useWindowLifecycle() {
   useEffect(() => {
     void taskStore.load();
@@ -39,10 +32,6 @@ export function useWindowLifecycle() {
       }),
       listen('shutdown-cancelled', () => { document.body.inert = false; exiting = false; }),
       getCurrentWebviewWindow().listen('request-hide', () => { void hideCurrentWindow(); }),
-      listen('widget-shown', () => {
-        if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-        document.querySelector('.widget-shell')?.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 160, easing: 'ease-out' });
-      }),
     ];
     return () => { subscriptions.forEach(subscription => { void subscription.then(unlisten => unlisten()); }); };
   }, []);

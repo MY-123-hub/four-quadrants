@@ -25,6 +25,7 @@ dmg="release/四象限_${version}_${architecture}.dmg"
 archive="release/四象限_${version}_${architecture}.app.zip"
 hdiutil create -ov -volname '四象限' -srcfolder "$staging" -format UDZO "$dmg"
 ditto -c -k --sequesterRsrc --keepParent 'release/四象限.app' "$archive"
-(cd release && shasum -a 256 "$(basename "$dmg")" "$(basename "$archive")" > SHA256SUMS.txt)
+# Preserve checksums for earlier downloads still linked by the README.
+(cd release && shasum -a 256 *.dmg *.app.zip > SHA256SUMS.txt)
 echo "$dmg"
 echo "$archive"
